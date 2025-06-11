@@ -1,7 +1,7 @@
 import logging
 import os
 
-def init_logger(cfg):
+def init_logger():
     os.makedirs('logs', exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,

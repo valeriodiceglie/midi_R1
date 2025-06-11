@@ -1,15 +1,16 @@
 import torch
+from pathlib import Path
 from torch.utils.data import IterableDataset
 from datasets import load_dataset
+from miditok import MusicTokenizer
 from symusic import Score
-from midi_r1.config import Config
 
 class GigaMIDIIterable(IterableDataset):
-    def __init__(self, cfg: Config, tokenizer):
-        #self.cfg = cfg
-        self.seq_len = cfg.data.seq_len
-        self.tokenizer = tokenizer
-        self.raw = load_dataset(path=cfg.data.path, split=cfg.data.split)
+    def __init__(self, seq_len:int, path:str, split:str, dump_folder: str):
+        self.seq_len = seq_len
+        self.raw = load_dataset(path, split=split)
+        self.dump_folder = Path(dump_folder)
+        self.dump_folder.mkdir(parents=True, exist_ok=True)
 
     def __iter__(self):
         for ex in self.raw:
