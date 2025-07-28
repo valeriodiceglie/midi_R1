@@ -1,51 +1,59 @@
-import torch
 from torch import nn
-from midiR1.model.embeddings import Embeddings
-from midiR1.model.transformer_block import DenseBlock, MoEBlock
+from src.midiR1.model.moe import ShareExpertMOE
+from src.midiR1.model.MLA import MLA
+import math
 
 
-class R1Transformer(nn.Module):
+class TransformerBlock(nn.Module):
     def __init__(
             self,
-            n_layers:int,
-            moe_experts:int,
-            top_moe_k:int, 
-            vocab_size:int, 
-            hidden_dim:int,
-            latent_dim:int, 
-            rotary_dim:int,
-            base_seq_len:int,
-            stage1_seq_len:int,
-            max_seq_len:int, 
-            dropout_rate:float):
+            d_model=512,
+            n_heads=4,
+            rope_theta=10_000,
+            max_len=1024,
+            d_expert=1024,
+            n_shared=2,
+            n_experts=8,
+            top_k=2,
+        ):
+        """
+        Transformer block
+        :param d_model: Model hidden dimension
+        :param n_heads: Number of attention heads
+        :param attn_dropout: Dropout probability applied to attention weights
+        :param max_position_embedding: The maximum number of positional indices supported by RoPE
+        :param rope_theta: Base frequency used by RoPE
+        :param v_head_dim: Dimension of value vectors per head
+        :param d_kv_comp: KV compression dimension
+        :param d_q_comp: Query compression dimension
+        :param d_rotate: Rotary embedding dimension
+        :param d_expert: Expert embedding dimension:
+        :param n_shared: number of shared experts
+        :param n_experts: number of routed experts
+        :param top_k: top k experts per token
+        """
         super().__init__()
-        self.d = hidden_dim
-        self.embeddings = Embeddings(vocab_size, hidden_dim, rotary_dim, dropout_rate, base_seq_len, stage1_seq_len, max_seq_len)
-        # construct blocks
-        self.layers = nn.ModuleList()
-        for i in range(n_layers):
-            if i < 3: # TODO -> add to configuration the Number of transformer blocks
-                self.layers.append(DenseBlock(hidden_dim, latent_dim, dropout_rate))
-            else:
-                if moe_experts > 0:
-                    self.layers.append(MoEBlock(hidden_dim, latent_dim, moe_experts, top_moe_k))
-                else:
-                    self.layers.append(DenseBlock(hidden_dim, latent_dim, dropout_rate))
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm1 = nn.RMSNorm(d_model)
+        self.attn = MLA(
+            d_model=d_model,
+            n_heads=n_heads,
+            rope_theta=rope_theta,
+            max_len=max_len
+        )
+        self.norm2 = nn.RMSNorm(d_model)
+        self.moe = ShareExpertMOE(
+            d_model=d_model,
+            n_expert=n_experts,
+            shared=n_shared,
+            top_k=top_k,
+        )
 
-    def forward(self, input_ids:torch.Tensor, key_cache=None, value_cache=None, labels=None):
-        x, freqs = self.embeddings(input_ids)
-        new_key_cache = []
-        new_value_cache = []
-        for block, k, v in zip(self.layers, key_cache or [], value_cache or []):
-            x, k, v = block(x, freqs, k, v)
-            new_key_cache.append(k)
-            new_value_cache.append(v)
-        x = self.norm(x)
-         
-        if labels is None:
-            # inference: return last‐token logits + full caches
-            return x, new_key_cache, new_value_cache
-        else:
-            # training: return token‐wise hidden for PredictionHeads
-            return x
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.size()
+        attn_out, kv = self.attn(x)
+        x = x + attn_out
+        x = self.norm2(x)
+        moe_out, moe_loss = self.moe(x)
+        x = x + moe_out
+        return x, kv
+

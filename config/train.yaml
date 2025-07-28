@@ -1,0 +1,33 @@
+# Training configuration for DeepSeek model
+batch_size: 64
+learning_rate: 0.0005
+num_epochs: 50
+
+# Optimizer settings
+optimizer: adamw  # Options: sgd, adamw
+momentum: 0.9   # For SGD optimizer
+nesterov: true  # For SGD optimizer
+
+# Scheduler settings
+scheduler: cosine_warmup  # Options: cosine, cosine_warmup, linear_warmup
+min_lr: 0.0001  # Minimum learning rate for cosine annealing
+restart_epochs: 10  # For cosine_warmup, T_0 parameter
+restart_mult: 2    # For cosine_warmup, T_mult parameter
+warmup_steps: 500  # For linear_warmup scheduler
+
+# Training settings
+gradient_clip: 0.5
+label_smoothing: 0.15
+use_augmentations: False
+gradient_accumulation_steps: 8
+patience: 50  # Early stopping patience
+eval_steps: 70  # Validation frequency in steps
+eval_nth_epoch: 10  # Validation frequency in epochs
+mtp_weight: 0.2  # Weight for MTP loss component
+
+tokenizer_config_path: './tokenizerconfig20k.json'
+train: 'C:/Users/Proprietario/repo/midi_data/chunks_midi_train'
+val: 'C:/Users/Proprietario/repo/midi_data/chunks_midi_val'
+test: "C:/Users/Proprietario/repo/midi_data/chunks_midi_test"
+checkpoint_dir: "C:/Users/Proprietario/repo/midiR1/checkpoints"
+pad_token_id: ""

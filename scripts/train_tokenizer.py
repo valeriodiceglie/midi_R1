@@ -1,7 +1,7 @@
 
 from miditok import MIDILike, TokenizerConfig
 from pathlib import Path
-from midiR1.utils.logging import init_logger
+from src.midiR1.utils.logging import init_logger
 
 init_logger()
 

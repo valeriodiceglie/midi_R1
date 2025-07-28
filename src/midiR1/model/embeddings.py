@@ -1,52 +1,25 @@
 import torch
-import math
-from torch import nn
-from midiR1.utils.rotary_embedding import (
-    apply_yarn_rotary,
-    RotaryEmbedding
-)
+import torch.nn as nn
 
-class Embeddings(nn.Module):
-    """
-    Token embeddings with two-stage YaRN decoupled RoPE.
-    """
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_dim: int,
-        rotary_dim: int,
-        dropout_rate: float,
-        base_seq_len: int,
-        stage1_seq_len: int,
-        max_seq_len: int
-    ):
+
+class RotaryPositionalEmbedding(nn.Module):
+    """Applies Rotary Positional Embeddings (RoPE) to enhance positional awareness."""
+    def __init__(self, dim: int):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.token_embed = nn.Embedding(vocab_size, hidden_dim)
-        self.rotary = RotaryEmbedding(rotary_dim)
-        self.dropout = nn.Dropout(dropout_rate)
+        self.dim = dim
+        # Precompute inverse frequencies for efficiency
+        self.register_buffer("inv_freq", 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)))
 
-        self.base_seq_len = base_seq_len
-        self.stage1_seq_len = stage1_seq_len
-        self.max_seq_len = max_seq_len
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, num_heads, seq_len, head_dim = x.shape
+        positions = torch.arange(seq_len, dtype=torch.float32, device=x.device)
+        sinusoid = positions[:, None] * self.inv_freq[None, :]  # [seq_len, dim/2]
+        sin, cos = torch.sin(sinusoid), torch.cos(sinusoid)
+        sin = sin[None, None, :, :].expand(batch_size, num_heads, -1, -1)
+        cos = cos[None, None, :, :].expand(batch_size, num_heads, -1, -1)
 
-    def forward(self, input_ids: torch.LongTensor):
-        # Token‐embed + scale
-        x = self.token_embed(input_ids) * math.sqrt(self.hidden_dim)
-        seq_len = input_ids.size(1)
-
-        # Always compute the base‐level angles once
-        base_freqs = self.rotary(self.base_seq_len)  # (base_seq_len, rotary_dim)
-
-        # Let apply_yarn_rotary figure out:
-        #    - if seq_len <= base_seq_len       → slice base_freqs
-        #    - elif seq_len <= stage1_seq_len   → interpolate base→stage1 then slice
-        #    - else                              → interpolate base→stage1→max then slice
-        freqs = apply_yarn_rotary(
-            base_freqs,
-            target_len=seq_len,
-            stage1_len=self.stage1_seq_len,
-            max_seq_len=self.max_seq_len,
-        )  # (seq_len, rotary_dim)
-
-        return self.dropout(x), freqs
+        # Rotate pairs of dimensions
+        x_rot = x.view(batch_size, num_heads, seq_len, head_dim // 2, 2)
+        x1, x2 = x_rot.unbind(dim=-1)
+        rotated = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        return rotated.view(batch_size, num_heads, seq_len, head_dim)

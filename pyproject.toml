@@ -6,7 +6,6 @@ authors = ["Valerio Di Ceglie <valerio.diceglie97@gmail.com>"]
 readme = "README.md"
 packages = [
   { include = "midiR1", from = "src" },
-  { include = "configs", from = "."}
 ]
 
 [tool.poetry.dependencies]

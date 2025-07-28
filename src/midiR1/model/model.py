@@ -1,53 +1,92 @@
 import torch
-from torch import nn
-from midiR1.model.transformer import R1Transformer
-from midiR1.model.prediction_head import PredictionHead
+import torch.nn as nn
+from src.midiR1.model.MLA import MultiHeadLatentAttention
+from src.midiR1.model.moe import MoE
+from src.midiR1.model.mtp import MultiTokenPrediction
+from typing import Optional
 
 
-class R1Model(nn.Module):
-    def __init__(self,
-                n_layers:int,
-                moe_experts:int,
-                top_moe_k:int,
-                vocab_size:int,
-                n_heads:int,
-                mtp_num_heads:int,
-                hidden_dim:int,
-                latent_dim:int,
-                rotary_dim:int,
-                base_seq_len:int,
-                stage1_seq_len:int,
-                max_seq_len:int,
-                dropout:float
-                ):
+class MidiR1(nn.Module):
+    """A Mixture-of-Experts Transformer with Multi-Token Prediction."""
+
+    def __init__(self, config: dict):
         super().__init__()
-        self.transformer = R1Transformer(n_layers, moe_experts, top_moe_k, vocab_size, hidden_dim, latent_dim, rotary_dim, base_seq_len, stage1_seq_len, max_seq_len, dropout)
-        # MTP heads
-        self.mtp_heads = nn.ModuleList([
-            PredictionHead(vocab_size, hidden_dim, n_heads, dropout) for _ in range(mtp_num_heads)
+        self.config = config
+
+        # Extract dropout rate from config or use default
+        dropout_rate = config.get("dropout_rate", 0.1)
+
+        self.embedding = nn.Embedding(config["vocab_size"], config["hidden_dim"])
+        # Add embedding dropout
+        self.embedding_dropout = nn.Dropout(dropout_rate)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "attn_norm": nn.LayerNorm(config["hidden_dim"]),
+                "attention": MultiHeadLatentAttention(
+                    hidden_dim=config["hidden_dim"],
+                    num_heads=config["num_heads"],
+                    head_dim=config["head_dim"],
+                    kv_compression_dim=config["kv_compression_dim"],
+                    query_compression_dim=config["query_compression_dim"],
+                    rope_dim=config["rope_dim"],
+                    dropout_rate=dropout_rate
+                ),
+                "moe_norm": nn.LayerNorm(config["hidden_dim"]),
+                "moe": MoE(
+                    hidden_dim=config["hidden_dim"],
+                    num_experts=config["num_experts"],
+                    top_k=config["activated_experts"],
+                    dropout_rate=dropout_rate
+                )
+            }) for _ in range(config["num_layers"])
         ])
 
-    def forward(self, input_ids:torch.Tensor, key_cache=None, value_cache=None, labels:torch.Tensor=None):
-        # input_ids: (batch, seq)
-        if labels is None:
-            hidden, key_cache, value_cache = self.transformer(input_ids, key_cache, value_cache, labels)
-        else:
-            hidden = self.transformer(input_ids, key_cache, value_cache, labels)
-        embeds = self.transformer.embeddings.token_embed(input_ids)
-        # sequential multi-token prediction
-        current_hidden = hidden
-        all_logits = []
-        for head in self.mtp_heads:
-            current_hidden, logit = head(current_hidden, embeds)
-            all_logits.append(logit)
-        # During inference, return only the last head's last token logits
-        if labels is None:
-            return all_logits[-1][:, -1, :], key_cache, value_cache
-        else:
-            # compute losses during training
-            loss_fn = nn.CrossEntropyLoss()
-            losses = [
-                loss_fn(l.view(-1, l.size(-1)), labels.view(-1))
-                for l in all_logits
-            ]
-            return sum(losses) / len(losses)
+        self.final_norm = nn.LayerNorm(config["hidden_dim"])
+        # Add final dropout
+        self.final_dropout = nn.Dropout(dropout_rate)
+
+        self.output_head = nn.Linear(config["hidden_dim"], config["vocab_size"])
+        self.mtp = MultiTokenPrediction(
+            config["hidden_dim"],
+            config["vocab_size"],
+            depth=1,
+            dropout_rate=dropout_rate
+        )
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None,
+                target_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Embedding layer
+        x = self.embedding(input_ids)
+        # Apply embedding dropout
+        x = self.embedding_dropout(x)
+
+        # Process through transformer layers
+        for layer in self.layers:
+            # Attention block
+            attn_input = layer["attn_norm"](x)
+            # Center and shift normalization
+            attn_input = attn_input - attn_input.mean(dim=-1, keepdim=True) + 1.0
+            attn_output = layer["attention"](attn_input, attention_mask)
+            x = x + attn_output
+
+            # MoE block
+            moe_input = layer["moe_norm"](x)
+            moe_output = layer["moe"](moe_input)
+            x = x + moe_output
+
+        # Final normalization
+        x = self.final_norm(x)
+        # Apply final dropout
+        x = self.final_dropout(x)
+
+        # Main logits from final hidden state
+        logits = self.output_head(x)
+
+        # During training or when explicitly requested, also compute MTP predictions
+        if (self.training and target_ids is not None) or not self.training:
+            # Get multi-token predictions
+            mtp_outputs = self.mtp(x)
+            return logits, mtp_outputs
+
+        return logits

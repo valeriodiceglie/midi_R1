@@ -4,11 +4,11 @@ from symusic import Score
 from datasets import load_dataset
 from miditok import REMI
 
-OUTPUT_DIR = Path("giga_midi_guitars")
+OUTPUT_DIR = Path("C:/Users/Proprietario/repo/giga_midi_guitars_test")
 OUTPUT_DIR.mkdir(exist_ok=True)
 GUITAR_PROGRAMS = set(range(24, 32))  # MIDI program numbers for guitars
 
-ds = load_dataset("Metacreation/GigaMIDI", "v1.1.0", split="train")
+ds = load_dataset("Metacreation/GigaMIDI", "v1.1.0", split="test")
 
 for example in tqdm(ds, desc="Scanning MIDIs"):
     # get raw bytes and an ID for naming
