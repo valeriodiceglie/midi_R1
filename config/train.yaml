@@ -25,9 +25,12 @@ eval_steps: 70  # Validation frequency in steps
 eval_nth_epoch: 10  # Validation frequency in epochs
 mtp_weight: 0.2  # Weight for MTP loss component
 
-tokenizer_config_path: './tokenizerconfig20k.json'
-train: 'C:/Users/Proprietario/repo/midi_data/chunks_midi_train'
-val: 'C:/Users/Proprietario/repo/midi_data/chunks_midi_val'
-test: "C:/Users/Proprietario/repo/midi_data/chunks_midi_test"
+tokenizer_config_path: './tokenizer20kREMI.json'
+train: 'C:/Users/Proprietario/repo/midi_data/128/chunks_midi_train'
+val: 'C:/Users/Proprietario/repo/midi_data/128/chunks_midi_val'
+test: "C:/Users/Proprietario/repo/midi_data/128/chunks_midi_test"
+fine_tuned: "C:/Users/Proprietario/repo/midi_data/128/chunks_midi_fine_tuned"
+gen: "C:/Users/Proprietario/repo/midi_data/64/chunks_midi_fine_tuned"
 checkpoint_dir: "C:/Users/Proprietario/repo/midiR1/checkpoints"
+generate_dir: "C:/Users/Proprietario/repo/midiR1/generate"
 pad_token_id: ""

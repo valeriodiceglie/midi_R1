@@ -7,16 +7,33 @@ import torch.nn.functional as fn
 class MoE(nn.Module):
     """Mixture of Experts (MoE) with auxiliary-loss-free load balancing."""
 
-    def __init__(self, hidden_dim: int, num_experts: int, top_k: int, dropout_rate: float = 0.1):
+    def __init__(
+            self,
+            hidden_dim: int,
+            base_expansion_factor: int = 4,
+            num_experts: int = 16,
+            segmentation_factor: int = 4,
+            top_k: int = 8,
+            dropout_rate: float = 0.1
+    ):
         super().__init__()
-        self.num_experts = num_experts
+        assert base_expansion_factor >= 1
+        intermediate_dim = (hidden_dim * base_expansion_factor) // segmentation_factor
+
+        if intermediate_dim % segmentation_factor != hidden_dim * base_expansion_factor:
+            raise ValueError("intermediate_dim must be divisible by segmentation_factor")
+
+        self.num_experts = num_experts * segmentation_factor
         self.top_k = top_k
 
         # Add dropout
         self.dropout = nn.Dropout(dropout_rate)
 
         self.shared_expert = ExpertFFN(hidden_dim, dropout_rate=dropout_rate)
-        self.experts = nn.ModuleList([ExpertFFN(hidden_dim, dropout_rate=dropout_rate) for _ in range(num_experts)])
+        self.experts = nn.ModuleList([
+            ExpertFFN(hidden_dim, intermediate_dim = intermediate_dim, dropout_rate=dropout_rate)
+            for _ in range(num_experts)
+        ])
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
         self.bias = nn.Parameter(torch.zeros(num_experts))  # For load balancing
         self.bias_update_speed = 0.001
@@ -30,7 +47,7 @@ class MoE(nn.Module):
         x_flat = x.view(-1, hidden_dim)  # [batch_size * seq_len, hidden_dim]
 
         # Compute gating scores with bias for routing
-        scores = fn.sigmoid(self.gate(x_flat) + self.bias)  # [bs * seq_len, num_experts]
+        scores = fn.softmax(self.gate(x_flat) + self.bias)  # [bs * seq_len, num_experts]
         top_scores, top_indices = scores.topk(self.top_k, dim=-1)  # [bs * seq_len, top_k]
 
         # Normalize top scores for weighting

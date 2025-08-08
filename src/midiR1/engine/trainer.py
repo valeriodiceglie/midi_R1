@@ -144,12 +144,13 @@ def get_scheduler(optimizer, train_loader, config):
         raise ValueError(f"Unsupported scheduler: {scheduler_type}")
 
 
-def train(model, train_loader, test_loader, val_loader, config):
+def train(model, ckpt_path, train_loader, test_loader, val_loader, config):
     """
     Training loop with improved handling for MTP outputs and stability enhancements.
 
     Args:
-        model: The DeepSeek model to train
+        model: model instance to train
+        ckpt_path: checkpoint file path
         train_loader: DataLoader for training data
         test_loader: DataLoader for test data
         val_loader: DataLoader for validation data
@@ -186,9 +187,15 @@ def train(model, train_loader, test_loader, val_loader, config):
     patience = config.get('patience', 3)
     patience_counter = 0
 
+    start_epoch = 0
+
+    if ckpt_path is not None:
+        ckpt,_ = load_checkpoint(ckpt_path, model, optimizer, scheduler, load_tokenizer=False)
+        start_epoch = ckpt.get("epoch", 0) + 1
+
     start_time = time.time()
 
-    for epoch in range(config['num_epochs']):
+    for epoch in range(start_epoch, config['num_epochs']):
         model.train()
         epoch_train_loss = 0.0
         epoch_train_accuracy = 0.0
@@ -314,7 +321,8 @@ def train(model, train_loader, test_loader, val_loader, config):
             eval_steps = config.get('eval_steps', len(train_loader) // 5)
             eval_epochs = config.get('eval_nth_epoch', 5)
 
-            if (batch_idx + 1) % eval_steps == 0 and (epoch + 1) % eval_epochs == 0:
+            #if (batch_idx + 1) % eval_steps == 0 and (epoch + 1) % eval_epochs == 0:
+            if (epoch + 1) % eval_epochs == 0:
                 val_loss, val_accuracy = validate(
                     model, val_loader, criterion,
                     config.get('pad_token_id', -100), device
@@ -403,7 +411,7 @@ def train(model, train_loader, test_loader, val_loader, config):
         f"Training completed in {int(hours)}h {int(minutes)}m {seconds:.2f}s"
     )
 
-    load_checkpoint('checkpoints/best_model.pt', model, optimizer)
+    load_checkpoint('C:/Users/Proprietario/repo/midiR1/checkpoints/best_model.pt', model, optimizer)
 
     test_loss, test_accuracy = validate(
        model, test_loader, criterion,

@@ -3,14 +3,11 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, d_model, eps=1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.eps = eps
 
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(dtype=input_dtype).to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states - hidden_states * torch.sqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+    def forward(self, x):
+        # x: (b_size, d_model)
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x / rms

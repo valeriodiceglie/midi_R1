@@ -5,6 +5,8 @@ import shutil
 import logging
 from datetime import datetime
 import pickle
+from pathlib import Path
+from miditok import MIDILike
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +86,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, batch_id, metrics=None, 
             json.dump(metadata, f, indent=2)
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, device='cuda', load_tokenizer=True):
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, device='cuda', load_tokenizer=True):
     """
     Load model and optimizer state from checkpoint.
     Also loads the corresponding tokenizer if available.
@@ -119,18 +121,21 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, device='cuda', load_
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
     # Try to load tokenizer if requested
     tokenizer = None
     if load_tokenizer:
-        tokenizer_path = checkpoint_path.replace('.pt', '_tokenizer.pkl')
+        ckpt_path = Path(checkpoint_path)
+        tokenizer_path = ckpt_path.parent / 'tokenizerconfig20k.json'
         if not os.path.exists(tokenizer_path):
             # Try alternative location patterns
             tokenizer_path = os.path.join(os.path.dirname(checkpoint_path),
                                           f"tokenizer_{os.path.basename(checkpoint_path).replace('checkpoint_', '').replace('.pt', '.pkl')}")
 
         if os.path.exists(tokenizer_path):
-            with open(tokenizer_path, 'rb') as f:
-                tokenizer = pickle.load(f)
+            tokenizer = MIDILike.from_pretrained(tokenizer_path, local_files_only=True)
             logger.info(f"Loaded tokenizer from {tokenizer_path}")
         else:
             logger.warning(f"No tokenizer found at {tokenizer_path}, using default T5Tokenizer")

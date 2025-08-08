@@ -3,7 +3,7 @@ import torch.nn as nn
 from src.midiR1.model.MLA import MultiHeadLatentAttention
 from src.midiR1.model.moe import MoE
 from src.midiR1.model.mtp import MultiTokenPrediction
-from typing import Optional
+from typing import Optional, Union, Tuple
 
 
 class MidiR1(nn.Module):
@@ -22,7 +22,7 @@ class MidiR1(nn.Module):
 
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                "attn_norm": nn.LayerNorm(config["hidden_dim"]),
+                "attn_norm": nn.RMSNorm(config["hidden_dim"]),
                 "attention": MultiHeadLatentAttention(
                     hidden_dim=config["hidden_dim"],
                     num_heads=config["num_heads"],
@@ -32,7 +32,7 @@ class MidiR1(nn.Module):
                     rope_dim=config["rope_dim"],
                     dropout_rate=dropout_rate
                 ),
-                "moe_norm": nn.LayerNorm(config["hidden_dim"]),
+                "moe_norm": nn.RMSNorm(config["hidden_dim"]),
                 "moe": MoE(
                     hidden_dim=config["hidden_dim"],
                     num_experts=config["num_experts"],
@@ -55,7 +55,7 @@ class MidiR1(nn.Module):
         )
 
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None,
-                target_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                target_ids: Optional[torch.Tensor] = None) -> Union[torch.Tensor| Tuple[torch.Tensor, torch.Tensor]]:
         # Embedding layer
         x = self.embedding(input_ids)
         # Apply embedding dropout
