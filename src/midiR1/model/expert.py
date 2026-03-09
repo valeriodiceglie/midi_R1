@@ -1,25 +1,31 @@
 import torch
 from torch import nn
-import torch.nn.functional as fn
+import torch.nn.functional as F
+
 
 class ExpertFFN(nn.Module):
-    """MoE experts."""
-    def __init__(self, hidden_dim: int, intermediate_dim: int = 4, dropout_rate: float = 0.1):
+    """
+    SwiGLU Expert FFN (DeepSeek-V2).
+
+    Architecture: output = W_down( SiLU(W_gate(x)) * W_up(x) )
+
+    Used for routed MoE experts (smaller intermediate_dim),
+    shared experts (full intermediate_dim), and the dense FFN
+    in the first layer.
+    """
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int, dropout_rate: float = 0.1):
         super().__init__()
-        #intermediate_dim = hidden_dim * expansion_factor
-        self.up = nn.Linear(hidden_dim, intermediate_dim)
-        self.gelu = nn.GELU()
-        # Add dropout after activation
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False)
         self.dropout = nn.Dropout(dropout_rate)
-        self.down = nn.Linear(intermediate_dim, hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Feedforward for MoE Experts.
         Args:
-            x (torch.Tensor): Input tensor
+            x: (*, hidden_dim)
         Returns:
-            Output tensor
+            (*, hidden_dim)
         """
-        # Apply dropout after activation
-        return self.down(self.dropout(self.gelu(self.up(x))))
+        return self.down_proj(self.dropout(F.silu(self.gate_proj(x)) * self.up_proj(x)))

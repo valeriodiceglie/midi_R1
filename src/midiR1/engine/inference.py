@@ -12,7 +12,7 @@ from symusic import Score
 logger = logging.getLogger(__name__)
 
 class GenerationConfig:
-    """Configuration for text generation."""
+    """Configuration for MIDI generation."""
 
     def __init__(
             self,
@@ -31,25 +31,6 @@ class GenerationConfig:
             length_penalty: float = 1.5,
             early_stopping: bool = False,
     ):
-        """
-        Initialize generation configuration.
-
-        Args:
-            max_length: Maximum length of generated text
-            temperature: Temperature for sampling
-            top_k: K for top-k sampling
-            top_p: P for nucleus sampling
-            repetition_penalty: Penalty for token repetition
-            no_repeat_ngram_size: Size of n-grams to avoid repeating
-            eos_token_id: End of sequence token ID
-            pad_token_id: Padding token ID
-            do_sample: Whether to sample (True) or use greedy decoding (False)
-            use_mtp: Whether to use multi-token prediction
-            mtp_speculation_mode: Whether to use speculative decoding with MTP
-            num_beams: Number of beams for beam search
-            length_penalty: Length penalty for beam search
-            early_stopping: Whether to stop early in beam search
-        """
         self.max_length = max_length
         self.temperature = temperature
         self.top_k = top_k
@@ -67,135 +48,146 @@ class GenerationConfig:
 
 
 class MidiGenerator:
-    """Text generator with various generation strategies."""
+    """MIDI generator with various generation strategies."""
 
     def __init__(self, model, tokenizer: MusicTokenizer, device='cuda'):
-        """
-        Initialize TextGenerator.
-
-        Args:
-            model: model
-            tokenizer: Tokenizer
-            device: Device to run generation on
-        """
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = device
         self.model.eval()
-
-        # Create directory for generation logs
         os.makedirs('logs', exist_ok=True)
 
     def generate(
             self,
-            prompts: Union[TokSequence, List[TokSequence]],
+            prompts: Union[list, Score],
             config: GenerationConfig
     ) -> Union[TokSequence, List[TokSequence]]:
         """
-        Generate text from prompts using the specified configuration.
+        Generate MIDI from prompts using the specified configuration.
 
         Args:
-            prompts: Single prompt or list of prompts
+            prompts: Single prompt or list of prompts (each is a tokenized sequence list)
             config: Generation configuration
 
         Returns:
-            Generated MIDI or list of generated MIDIs
+            Generated TokSequence or list of TokSequences
         """
-        # Convert single prompt to list
-        if isinstance(prompts, Score):
+        if not isinstance(prompts, list):
             prompts = [prompts]
             return_single = True
         else:
             return_single = False
 
-        # Choose generation strategy based on config
         if config.num_beams > 1:
-            # Beam search
             generated_midis = self.generate_with_beam_search(prompts, config)
-        elif config.use_mtp and config.mtp_speculation_mode:
-            # Speculative decoding with multi-token prediction
+        elif config.use_mtp and config.mtp_speculation_mode and hasattr(self.model, 'mtp_depth') and self.model.mtp_depth > 0:
             generated_midis = self.generate_with_speculation(prompts, config)
         else:
-            # Standard auto-regressive generation
             generated_midis = self.generate_standard(prompts, config)
 
-        # Return single text or list based on input
         if return_single:
             return generated_midis[0]
         return generated_midis
 
-    def generate_standard(
-            self,
-            prompts: List[TokSequence],
-            config: GenerationConfig
-    ) -> List[TokSequence]:
-
+    def _sample_token(self, logits: torch.Tensor, generated: torch.Tensor,
+                      config: GenerationConfig) -> torch.Tensor:
         """
-        Standard autoregressive text generation.
+        Sample a single token from logits with temperature, repetition penalty,
+        n-gram blocking, top-k, and top-p filtering.
 
         Args:
-            prompts: List of prompts
+            logits: [1, V] logits for next token
+            generated: [1, T] current generated sequence
             config: Generation configuration
 
         Returns:
-            List of generated texts
+            [1, 1] sampled token tensor
         """
+        next_logits = logits.clone()
 
+        # Temperature scaling
+        if config.temperature != 1.0:
+            next_logits = next_logits / config.temperature
+
+        # Repetition penalty
+        if config.repetition_penalty != 1.0:
+            for token_id in generated[0].unique():
+                next_logits[0, token_id] /= config.repetition_penalty
+
+        # N-gram repetition prevention
+        if 0 < config.no_repeat_ngram_size < generated.size(1):
+            ngrams = self._get_ngrams(generated[0], config.no_repeat_ngram_size)
+            banned_tokens = self._get_banned_tokens(generated[0], ngrams, config.no_repeat_ngram_size)
+            for token_id in banned_tokens:
+                next_logits[0, token_id] = -float('inf')
+
+        # Top-k filtering
+        if config.top_k > 0:
+            next_logits = self._top_k_filtering(next_logits, config.top_k)
+
+        # Top-p (nucleus) filtering
+        if config.top_p < 1.0:
+            next_logits = self._top_p_filtering(next_logits, config.top_p)
+
+        # Sample or greedy
+        if config.do_sample:
+            probs = fn.softmax(next_logits, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+        else:
+            return torch.argmax(next_logits, dim=-1, keepdim=True)
+
+    def generate_standard(
+            self,
+            prompts: List,
+            config: GenerationConfig
+    ) -> List[TokSequence]:
+        """
+        Standard autoregressive generation with KV cache.
+
+        Args:
+            prompts: List of tokenized prompt sequences
+            config: Generation configuration
+
+        Returns:
+            List of generated TokSequences
+        """
         self.model.eval()
         results = []
 
         for in_seq in prompts:
             input_ids = torch.tensor(in_seq[0].ids, device=self.device).unsqueeze(0)
             generated = input_ids.clone()
-            attention = torch.ones_like(generated, device=self.device)
+            past_key_values = None
             max_new = min(config.max_length - generated.size(1), config.max_length)
 
-            for _ in range(max_new):
+            for step in range(max_new):
                 with torch.no_grad():
-                    out = self.model(generated, attention_mask=attention)
-                logits = out[0] if isinstance(out, tuple) else out
-                next_logits = logits[:, -1, :]
+                    if past_key_values is None:
+                        # First pass: process entire prompt
+                        current_input = generated
+                        attention_mask = torch.ones_like(generated, device=self.device)
+                    else:
+                        # Subsequent steps: only the new token (KV cache handles history)
+                        current_input = generated[:, -1:]
+                        attention_mask = None
 
-                # temperature
-                if config.temperature != 1.0:
-                    next_logits = next_logits / config.temperature
+                    out = self.model(
+                        current_input,
+                        attention_mask=attention_mask,
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                    )
 
-                if config.repetition_penalty != 1.0:
-                    for i in range(logits.size(0)):
-                        for token_id in generated[i].unique():
-                            next_logits[i, token_id] /= config.repetition_penalty
+                    if isinstance(out, tuple):
+                        logits = out[0]
+                        past_key_values = out[-1]
+                    else:
+                        logits = out
 
-                    # Apply n-gram repetition prevention
-                if 0 < config.no_repeat_ngram_size < generated.size(1):
-                    for i in range(logits.size(0)):
-                        ngrams = self._get_ngrams(generated[i], config.no_repeat_ngram_size)
-                        banned_tokens = self._get_banned_tokens(generated[i], ngrams, config.no_repeat_ngram_size)
-                        for token_id in banned_tokens:
-                            next_logits[i, token_id] = -float('inf')
-
-                # top-k / top-p
-                if config.top_k > 0:
-                    next_logits = self._top_k_filtering(next_logits, config.top_k)
-                if config.top_p < 1.0:
-                    next_logits = self._top_p_filtering(next_logits, config.top_p)
-
-                if config.do_sample:
-                    probs = fn.softmax(next_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-
-                    # Log token probabilities for analysis
-                    token_prob = probs[0, next_token[0, 0]].item()
-
-                    # Get top 5 candidates for logging
-                    top_values, top_indices = torch.topk(probs[0], k=5)
-                    top_candidates = [(idx.item(), val.item()) for idx, val in zip(top_indices, top_values)]
-                else:
-                    next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
-                    token_prob = fn.softmax(next_logits, dim=-1)[0, next_token[0, 0]].item()
-                    top_candidates = [(next_token[0, 0].item(), token_prob)]
+                next_logits = logits[:, -1:, :]
+                next_token = self._sample_token(next_logits.squeeze(1), generated, config)
 
                 generated = torch.cat([generated, next_token], dim=1)
-                attention = torch.cat([attention, torch.ones((1,1), device=self.device)], dim=1)
 
                 if next_token.item() == config.eos_token_id:
                     break
@@ -210,182 +202,171 @@ class MidiGenerator:
 
     def generate_with_speculation(
                 self,
-                prompts: List[TokSequence],
+                prompts: List,
                 config: GenerationConfig
     ) -> List[TokSequence]:
         """
-        Generate MIDI using speculative decoding with MTP.
+        Generate MIDI using speculative decoding with MTP draft predictions.
+
+        The MTP heads produce draft tokens for D future positions.
+        A verification pass accepts drafts that match the verifier's predictions.
 
         Args:
-            prompts: List of prompts
+            prompts: List of tokenized prompt sequences
             config: Generation configuration
 
         Returns:
-            List of generated MIDIs
+            List of generated TokSequences
         """
         generated_midis = []
+        draft_depth = self.model.mtp_depth
 
         for idx, prompt in enumerate(prompts):
-            # Encode prompt
             input_ids = torch.tensor(prompt[0].ids, device=self.device).unsqueeze(0)
-
-            # Track generation statistics
-            tokens_generated = 0
-            speculative_tokens_accepted = 0
-
-            # Initialize generation
             generated = input_ids.clone()
-            attention_mask = torch.ones_like(generated, device=self.device)
+            past_key_values = None
 
-            # Generation loop
-            current_length = generated.size(1)
-            max_gen_length = min(config.max_length - current_length, config.max_length)
+            tokens_generated = 0
+            accepted_drafts = 0
+            max_new = config.max_length - generated.size(1)
 
-            with tqdm(total=max_gen_length, desc=f"Generating MIDIs {idx + 1}/{len(prompts)}") as pbar:
-                while current_length < config.max_length:
-                    # Forward pass
+            with tqdm(total=max_new, desc=f"Generating MIDI {idx + 1}/{len(prompts)}") as pbar:
+                while tokens_generated < max_new:
                     with torch.no_grad():
-                        outputs = self.model(generated, attention_mask=attention_mask)
+                        if past_key_values is None:
+                            current_input = generated
+                            attention_mask = torch.ones_like(generated, device=self.device)
+                        else:
+                            current_input = generated[:, -1:]
+                            attention_mask = None
 
-                    # Process outputs - handle both main predictions and MTP
-                    if isinstance(outputs, tuple) and len(outputs) > 1:
-                        main_logits, mtp_logits = outputs
-                    else:
-                        # MTP not available, fall back to standard generation
-                        main_logits = outputs
-                        mtp_logits = None
+                        # Get main prediction + MTP drafts
+                        out = self.model(
+                            current_input,
+                            attention_mask=attention_mask,
+                            use_mtp_drafts=True,
+                            use_cache=True,
+                            past_key_values=past_key_values,
+                        )
 
-                    # Sample next token from main logits
-                    next_token_logits = main_logits[:, -1, :].clone() / config.temperature
+                        main_logits, mtp_draft_logits, past_key_values = out
 
-                    # Apply repetition penalty
-                    for token_id in generated[0].unique():
-                        next_token_logits[0, token_id] /= config.repetition_penalty
-
-                    # Filter logits
-                    if config.top_k > 0:
-                        next_token_logits = self._top_k_filtering(next_token_logits, config.top_k)
-                    if config.top_p < 1.0:
-                        next_token_logits = self._top_p_filtering(next_token_logits, config.top_p)
-
-                    # Sample token
-                    if config.do_sample:
-                        probs = fn.softmax(next_token_logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1)
-                    else:
-                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-                    # Add to sequence
-                    generated = torch.cat([generated, next_token], dim=1)
-                    attention_mask = torch.cat([attention_mask, torch.ones((1, 1), device=self.device)], dim=1)
-                    current_length += 1
+                    # Sample main token
+                    main_token = self._sample_token(main_logits[:, -1, :], generated, config)
+                    generated = torch.cat([generated, main_token], dim=1)
                     tokens_generated += 1
                     pbar.update(1)
 
-                    # Check for EOS
-                    if next_token.item() == config.eos_token_id:
+                    if main_token.item() == config.eos_token_id:
                         break
 
-                    # Speculative decoding using MTP if available
-                    if mtp_logits is not None and mtp_logits.size(1) > 0:
-                        # Get MTP predictions for the next tokens
-                        # We'll try to predict up to depth tokens ahead
-                        depth = min(mtp_logits.size(1), 3)  # Limit depth to avoid too much speculation
+                    # Collect draft tokens from MTP heads
+                    draft_tokens = []
+                    for draft_logits in mtp_draft_logits:
+                        draft_token = self._sample_token(
+                            draft_logits[:, -1, :], generated, config
+                        )
+                        draft_tokens.append(draft_token)
 
-                        speculation_successful = False
-                        for d in range(depth):
-                            # MTP logits for the current position
-                            mtp_token_logits = mtp_logits[0, d, -1, :].clone() / config.temperature
+                    if not draft_tokens:
+                        continue
 
-                            # Apply repetition penalty
-                            for token_id in generated[0].unique():
-                                mtp_token_logits[token_id] /= config.repetition_penalty
+                    # Verification: run all draft tokens through the model
+                    all_drafts = torch.cat(draft_tokens, dim=1)  # [1, D]
 
-                            # Filter logits
-                            if config.top_k > 0:
-                                mtp_token_logits = self._top_k_filtering(mtp_token_logits.unsqueeze(0),
-                                                                         config.top_k).squeeze(0)
-                            if config.top_p < 1.0:
-                                mtp_token_logits = self._top_p_filtering(mtp_token_logits.unsqueeze(0),
-                                                                         config.top_p).squeeze(0)
+                    with torch.no_grad():
+                        verify_out = self.model(
+                            all_drafts,
+                            use_cache=True,
+                            past_key_values=past_key_values,
+                        )
+                        if isinstance(verify_out, tuple):
+                            verify_logits = verify_out[0]
+                            verify_cache = verify_out[-1]
+                        else:
+                            verify_logits = verify_out
+                            verify_cache = past_key_values
 
-                            # Sample speculative token
-                            if config.do_sample:
-                                mtp_probs = fn.softmax(mtp_token_logits, dim=-1)
-                                speculative_token = torch.multinomial(mtp_probs.unsqueeze(0), num_samples=1)
-                            else:
-                                speculative_token = torch.argmax(mtp_token_logits, dim=-1, keepdim=True).unsqueeze(
-                                    0)
+                    # Accept drafts that match verification
+                    n_accepted = 0
+                    for d in range(len(draft_tokens)):
+                        verify_token = verify_logits[:, d, :].argmax(dim=-1)
+                        if verify_token.item() == draft_tokens[d].item():
+                            n_accepted += 1
+                            accepted_drafts += 1
+                        else:
+                            # Use verifier's token instead and stop accepting
+                            draft_tokens[d] = verify_token.unsqueeze(0)
+                            n_accepted += 1
+                            break
 
-                            # In a real implementation, we'd verify this token
-                            # but for simplicity, we'll accept it with high probability
-                            if torch.rand(1).item() < 0.8:  # 80% chance to accept speculative token
-                                generated = torch.cat([generated, speculative_token], dim=1)
-                                attention_mask = torch.cat([attention_mask, torch.ones((1, 1), device=self.device)],
-                                                           dim=1)
-                                current_length += 1
-                                tokens_generated += 1
-                                speculative_tokens_accepted += 1
-                                pbar.update(1)
-                                speculation_successful = True
+                    # Append accepted tokens
+                    accepted = torch.cat(draft_tokens[:n_accepted], dim=1)
+                    generated = torch.cat([generated, accepted], dim=1)
+                    tokens_generated += n_accepted
+                    pbar.update(n_accepted)
 
-                                # Check for EOS
-                                if speculative_token.item() == config.eos_token_id:
-                                    break
-                            else:
-                                # Speculation failed, don't continue with deeper tokens
+                    # Trim KV cache to match actual generated length
+                    cache_target_len = generated.size(1)
+                    trimmed_cache = []
+                    for layer_cache in verify_cache:
+                        if layer_cache is not None and layer_cache.c_kv.shape[1] > cache_target_len:
+                            layer_cache.trim(cache_target_len)
+                        trimmed_cache.append(layer_cache)
+                    past_key_values = trimmed_cache
+
+                    # Check for EOS in accepted tokens
+                    eos_found = False
+                    if config.eos_token_id is not None:
+                        for t in draft_tokens[:n_accepted]:
+                            if t.item() == config.eos_token_id:
+                                eos_found = True
                                 break
-
-                        # If we failed to use speculation, continue standard generation
-                        if not speculation_successful:
-                            continue
-
-                    # If we've reached max length, break
-                    if current_length >= config.max_length:
+                    if eos_found:
                         break
 
-            # Decode and add to results
+                    if generated.size(1) >= config.max_length:
+                        break
+
+            # Decode to TokSequence
             full_ids = generated[0].tolist()
             new_tok_seq = TokSequence(ids=full_ids, are_ids_encoded=True)
             self.tokenizer.decode_token_ids(new_tok_seq)
             self.tokenizer.complete_sequence(new_tok_seq)
             generated_midis.append(new_tok_seq)
 
-            # Log speculation statistics
-            if speculative_tokens_accepted > 0:
-                logger.info(f"Speculation stats: {speculative_tokens_accepted}/{tokens_generated} tokens "
-                            f"({100 * speculative_tokens_accepted / tokens_generated:.1f}%) generated speculatively.")
+            if accepted_drafts > 0 and tokens_generated > 0:
+                logger.info(
+                    f"Speculation stats: {accepted_drafts}/{tokens_generated} tokens "
+                    f"({100 * accepted_drafts / tokens_generated:.1f}%) generated speculatively."
+                )
 
         return generated_midis
 
     def generate_with_beam_search(
                 self,
-                prompts: List[TokSequence],
+                prompts: List,
                 config: GenerationConfig
     ) -> List[TokSequence]:
         """
         Generate MIDI using beam search.
 
         Args:
-            prompts: List of prompts
+            prompts: List of tokenized prompt sequences
             config: Generation configuration
 
         Returns:
-            List of generated MIDIs
+            List of generated TokSequences
         """
         generated_midis = []
 
         for prompt_idx, prompt in enumerate(prompts):
-            # Encode prompt
-
             input_ids = torch.tensor(prompt[0].ids, device=self.device).unsqueeze(0)
-            generated = input_ids.clone()
 
-            # Initialize beams with the input sequence and score 0
+            # Initialize beams: (sequence_tensor, score)
             beams = [(input_ids.clone(), 0.0)]
             finished_beams = []
 
-            # Generation loop
             current_length = input_ids.size(1)
             max_gen_length = min(config.max_length - current_length, config.max_length)
 
@@ -396,99 +377,77 @@ class MidiGenerator:
 
                     new_beams = []
 
-                    for beam_idx, (beam_sequence, beam_score) in enumerate(beams):
-                        # Skip if this beam is done
+                    for beam_sequence, beam_score in beams:
                         if beam_sequence[0, -1].item() == config.eos_token_id:
                             finished_beams.append((beam_sequence, beam_score))
                             continue
 
-                        # Forward pass
                         attention_mask = torch.ones_like(beam_sequence, device=self.device)
 
                         with torch.no_grad():
                             outputs = self.model(beam_sequence, attention_mask=attention_mask)
 
-                        # Handle outputs
                         if isinstance(outputs, tuple):
                             logits = outputs[0]
                         else:
                             logits = outputs
 
-                        # Get next token logits
                         next_token_logits = logits[:, -1, :].clone() / config.temperature
 
-                        # Apply repetition penalty
+                        # Repetition penalty
                         for token_id in beam_sequence[0].unique():
                             next_token_logits[0, token_id] /= config.repetition_penalty
 
-                        # Apply top-k and top-p filtering
                         if config.top_k > 0:
                             next_token_logits = self._top_k_filtering(next_token_logits, config.top_k)
                         if config.top_p < 1.0:
                             next_token_logits = self._top_p_filtering(next_token_logits, config.top_p)
 
-                        # Convert logits to probabilities
                         next_token_probs = fn.softmax(next_token_logits, dim=-1)
 
-                        # Get top candidates for this beam
                         topk_probs, topk_tokens = torch.topk(
                             next_token_probs, k=config.num_beams, dim=-1
                         )
 
-                        # Expand beams
-                        for token_idx, (token, prob) in enumerate(zip(topk_tokens[0], topk_probs[0])):
-                            # Create new beam by appending token
+                        for token, prob in zip(topk_tokens[0], topk_probs[0]):
                             new_sequence = torch.cat(
                                 [beam_sequence, token.unsqueeze(0).unsqueeze(0)],
                                 dim=1
                             )
-
-                            # Update score with log probability
                             log_prob = torch.log(prob).item()
                             new_score = beam_score + log_prob
 
-                            # Apply length penalty
                             if config.length_penalty != 1.0:
                                 length_factor = ((5.0 + new_sequence.size(1)) / 6.0) ** config.length_penalty
                                 new_score = new_score / length_factor
 
                             new_beams.append((new_sequence, new_score))
 
-                    # Sort and keep top beams
                     new_beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:config.num_beams]
 
-                    # Update beams
-                    beams = [(seq, score) for seq, score in new_beams if seq[0, -1].item() != config.eos_token_id]
-
-                    # Add completed beams
+                    beams = [(seq, score) for seq, score in new_beams
+                             if seq[0, -1].item() != config.eos_token_id]
                     finished_beams.extend(
-                        [(seq, score) for seq, score in new_beams if seq[0, -1].item() == config.eos_token_id])
+                        [(seq, score) for seq, score in new_beams
+                         if seq[0, -1].item() == config.eos_token_id]
+                    )
 
-                    # Update progress
                     pbar.update(1)
 
-                    # Early stopping if all beams are finished
                     if not beams or (config.early_stopping and len(finished_beams) >= config.num_beams):
                         break
 
-            # If no beams finished, use the best unfinished ones
             if not finished_beams and beams:
                 finished_beams = beams
 
-            # If we have some finished beams, select best one
             if finished_beams:
                 finished_beams = sorted(finished_beams, key=lambda x: x[1], reverse=True)
                 best_beam = finished_beams[0][0]
                 full_ids = best_beam[0].tolist()
-                new_tok_seq = TokSequence(ids=full_ids, are_ids_encoded=True)
-
             else:
-                # Fallback to the input
                 full_ids = input_ids[0].tolist()
-                new_tok_seq = TokSequence(ids=full_ids)
-                self.tokenizer.decode_token_ids(new_tok_seq)
-                self.tokenizer.complete_sequence(new_tok_seq)
 
+            new_tok_seq = TokSequence(ids=full_ids, are_ids_encoded=True)
             self.tokenizer.decode_token_ids(new_tok_seq)
             self.tokenizer.complete_sequence(new_tok_seq)
             generated_midis.append(new_tok_seq)
@@ -507,14 +466,10 @@ class MidiGenerator:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(fn.softmax(sorted_logits, dim=-1), dim=-1)
 
-        # Remove tokens with cumulative probability above the threshold
         sorted_indices_to_remove = cumulative_probs > top_p
-
-        # Shift the indices to the right to keep also the first token above the threshold
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
-        # Scatter sorted tensors to original indexing
         indices_to_remove = sorted_indices_to_remove.scatter(
             dim=1, index=sorted_indices, src=sorted_indices_to_remove
         )
@@ -536,214 +491,11 @@ class MidiGenerator:
             ngrams: List[Tuple[int, ...]],
             n: int
     ) -> List[int]:
-        """
-        Get tokens that would form a repeated n-gram.
-
-        Args:
-            token_ids: Current sequence of tokens
-            ngrams: List of existing n-grams
-            n: Size of n-grams
-
-        Returns:
-            List of banned tokens
-        """
+        """Get tokens that would form a repeated n-gram."""
         banned_tokens = []
-
-        # Check if current (n-1)-gram exists and would form a banned n-gram
         if len(token_ids) >= (n - 1):
             current_prefix = tuple(token_ids[-(n - 1):].tolist())
             for ngram in ngrams:
                 if ngram[:-1] == current_prefix:
                     banned_tokens.append(ngram[-1])
-
         return banned_tokens
-
-    # Utility functions
-# def sample_text(model, tokenizer, prompts, num_samples=5, max_length=100, device='cuda'):
-#     """
-#     Generate multiple text samples from each prompt for analysis.
-#
-#     Args:
-#         model: DeepSeek model
-#         tokenizer: Tokenizer
-#         prompts: List of prompts
-#         num_samples: Number of samples per prompt
-#         max_length: Maximum generation length
-#         device: Device to run on
-#
-#     Returns:
-#         Dictionary mapping prompts to lists of generated samples
-#     """
-#     generator = MidiGenerator(model, tokenizer, device)
-#
-#     results = {}
-#     for prompt in prompts:
-#         samples = []
-#
-#         # Define configurations with different parameters
-#         configs = [
-#             # Standard sampling
-#             GenerationConfig(
-#                 max_length=max_length,
-#                 temperature=0.8,
-#                 top_p=0.9,
-#                 repetition_penalty=1.2,
-#                 eos_token_id=tokenizer.eos_token_id,
-#                 pad_token_id=tokenizer.pad_token_id
-#             ),
-#             # Creative sampling
-#             GenerationConfig(
-#                 max_length=max_length,
-#                 temperature=1.2,
-#                 top_p=0.95,
-#                 repetition_penalty=1.05,
-#                 eos_token_id=tokenizer.eos_token_id,
-#                 pad_token_id=tokenizer.pad_token_id
-#             ),
-#             # More focused
-#             GenerationConfig(
-#                 max_length=max_length,
-#                 temperature=0.6,
-#                 top_p=0.85,
-#                 repetition_penalty=1.3,
-#                 eos_token_id=tokenizer.eos_token_id,
-#                 pad_token_id=tokenizer.pad_token_id
-#             ),
-#             # Beam search
-#             GenerationConfig(
-#                 max_length=max_length,
-#                 do_sample=False,
-#                 num_beams=4,
-#                 length_penalty=1.0,
-#                 eos_token_id=tokenizer.eos_token_id,
-#                 pad_token_id=tokenizer.pad_token_id
-#             ),
-#             # With MTP
-#             GenerationConfig(
-#                 max_length=max_length,
-#                 temperature=0.7,
-#                 top_p=0.9,
-#                 repetition_penalty=1.2,
-#                 use_mtp=True,
-#                 mtp_speculation_mode=True,
-#                 eos_token_id=tokenizer.eos_token_id,
-#                 pad_token_id=tokenizer.pad_token_id
-#             )
-#         ]
-#
-#         for i, config in enumerate(configs):
-#             generated = generator.generate(prompt, config)
-#             samples.append({
-#                 'config': f"Config {i + 1}",
-#                 'parameters': {k: v for k, v in config.__dict__.items() if not k.startswith('_')},
-#                 'text': generated
-#             })
-#
-#         results[prompt] = samples
-#
-#     return results
-
-# def evaluate_model_generation(model, tokenizer, device='cuda'):
-#     """
-#     Evaluate model text generation on a set of standard prompts.
-#
-#     Args:
-#         model: DeepSeek model
-#         tokenizer: Tokenizer
-#         device: Device to run on
-#
-#     Returns:
-#         Dictionary with evaluation results
-#     """
-#     # Standard evaluation prompts
-#     eval_prompts = [
-#         "The history of artificial intelligence began",
-#         "The three most important factors in real estate are",
-#         "In recent years, climate change has",
-#         "The solution to the equation x² + 5x + 6 = 0 is",
-#         "The best way to learn a new language is to"
-#     ]
-#
-#     # Create generator
-#     generator = MidiGenerator(model, tokenizer, device)
-#
-#     # Define generation configs to test
-#     configs = {
-#         'greedy': GenerationConfig(
-#             max_length=100,
-#             do_sample=False,
-#             eos_token_id=tokenizer.eos_token_id,
-#             pad_token_id=tokenizer.pad_token_id
-#         ),
-#         'sampling': GenerationConfig(
-#             max_length=100,
-#             temperature=0.8,
-#             top_p=0.9,
-#             repetition_penalty=1.2,
-#             eos_token_id=tokenizer.eos_token_id,
-#             pad_token_id=tokenizer.pad_token_id
-#         ),
-#         'beam_search': GenerationConfig(
-#             max_length=100,
-#             do_sample=False,
-#             num_beams=4,
-#             length_penalty=1.0,
-#             eos_token_id=tokenizer.eos_token_id,
-#             pad_token_id=tokenizer.pad_token_id
-#         ),
-#         'mtp_speculation': GenerationConfig(
-#             max_length=100,
-#             temperature=0.7,
-#             top_p=0.9,
-#             repetition_penalty=1.2,
-#             use_mtp=True,
-#             mtp_speculation_mode=True,
-#             eos_token_id=tokenizer.eos_token_id,
-#             pad_token_id=tokenizer.pad_token_id
-#         )
-#     }
-#
-#     # Generate text and collect results
-#     results = {}
-#
-#     for config_name, config in configs.items():
-#         config_results = {}
-#
-#         # Generate text for each prompt
-#         for prompt in eval_prompts:
-#             start_time = time.time()
-#             generated = generator.generate(prompt, config)
-#             generation_time = time.time() - start_time
-#
-#             # Analyze result
-#             tokens_generated = len(tokenizer.encode(generated)) - len(tokenizer.encode(prompt))
-#
-#             config_results[prompt] = {
-#                 'prompt': prompt,
-#                 'generated_text': generated,
-#                 'tokens_generated': tokens_generated,
-#                 'generation_time': generation_time,
-#                 'tokens_per_second': tokens_generated / generation_time if generation_time > 0 else 0
-#             }
-#
-#         results[config_name] = config_results
-#
-#     # Create summary
-#     summary = {
-#         'generation_settings': {name: {k: v for k, v in config.__dict__.items()
-#                                        if not k.startswith('_')} for name, config in configs.items()},
-#         'performance': {
-#             name: {
-#                 'average_tokens_per_second': sum(r['tokens_per_second'] for r in config_result.values()) / len(
-#                     config_result),
-#                 'average_generation_time': sum(r['generation_time'] for r in config_result.values()) / len(
-#                     config_result),
-#                 'average_tokens_generated': sum(r['tokens_generated'] for r in config_result.values()) / len(
-#                     config_result)
-#             }
-#             for name, config_result in results.items()
-#         },
-#         'detailed_results': results
-#     }
-#
-#     return summary

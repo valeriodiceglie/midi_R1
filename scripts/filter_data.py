@@ -63,7 +63,8 @@ def main():
     ds = load_dataset("Metacreation/GigaMIDI", "v1.1.0", split="train")
     authors = "Allan Holdsworth"
     ds = filter_by_author(ds, authors)
-    filter_by_guitar(ds)
+    print(ds['title'])
+    #filter_by_guitar(ds)
 
 
 if __name__ == "__main__":

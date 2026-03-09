@@ -1,212 +1,287 @@
-import matplotlib.pyplot as plt
+"""MIDI-level evaluation metrics: KL divergence, overlapping area, Frechet Music Distance.
+
+Compares distributions of musical features between reference and generated MIDI sets.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
 import numpy as np
-import os
+from symusic import Score
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
+
+_VEL_BINS = np.linspace(0, 128, 9)       # 8 velocity bins
+_DUR_BINS_TICKS = np.array([0, 60, 120, 240, 480, 960, 1920, 3840, 7680])  # 8 duration bins
 
 
-def plot_metrics(train_losses, val_losses,
-                 train_accuracies=None, val_accuracies=None):
+def extract_midi_features(score: Score) -> np.ndarray:
+    """Extract a 40-dimensional feature vector from a MIDI score.
+
+    Features (in order):
+        0-11  : Pitch class histogram (12, normalised)
+        12-14 : Pitch min, max, mean (3)
+        15    : Note density (notes per beat) (1)
+        16-17 : Mean velocity, std velocity (2)
+        18-25 : Velocity histogram (8, normalised)
+        26-27 : Mean duration, std duration (2)
+        28-35 : Duration histogram (8, normalised)
+        36-37 : Mean IOI, IOI std (2)
+        38    : Average polyphony (1)
+        39    : Polyphony rate (1)
     """
-    Plot training and validation metrics (loss and accuracy).
+    pitches = []
+    velocities = []
+    durations = []
+    onsets = []
 
-    Args:
-        train_losses: List of training losses per epoch
-        val_losses: List of validation losses per epoch
-        train_accuracies: List of training accuracies per epoch (optional)
-        val_accuracies: List of validation accuracies per epoch (optional)
+    for track in score.tracks:
+        for note in track.notes:
+            pitches.append(note.pitch)
+            velocities.append(note.velocity)
+            durations.append(note.duration)
+            onsets.append(note.time)
+
+    feats = np.zeros(40, dtype=np.float64)
+
+    if not pitches:
+        return feats
+
+    pitches = np.array(pitches, dtype=np.float64)
+    velocities = np.array(velocities, dtype=np.float64)
+    durations = np.array(durations, dtype=np.float64)
+    onsets = np.array(onsets, dtype=np.float64)
+
+    # Pitch class histogram (12)
+    pc = (pitches.astype(int) % 12).astype(int)
+    pc_hist = np.bincount(pc, minlength=12).astype(np.float64)
+    pc_sum = pc_hist.sum()
+    if pc_sum > 0:
+        pc_hist /= pc_sum
+    feats[0:12] = pc_hist
+
+    # Pitch stats (3)
+    feats[12] = pitches.min()
+    feats[13] = pitches.max()
+    feats[14] = pitches.mean()
+
+    # Note density (1) — notes per beat
+    tpq = score.ticks_per_quarter if score.ticks_per_quarter > 0 else 480
+    total_ticks = max(onsets.max() - onsets.min(), 1.0)
+    total_beats = total_ticks / tpq
+    feats[15] = len(pitches) / max(total_beats, 1.0)
+
+    # Velocity stats (2)
+    feats[16] = velocities.mean()
+    feats[17] = velocities.std() if len(velocities) > 1 else 0.0
+
+    # Velocity histogram (8)
+    vel_hist, _ = np.histogram(velocities, bins=_VEL_BINS)
+    vel_hist = vel_hist.astype(np.float64)
+    vel_sum = vel_hist.sum()
+    if vel_sum > 0:
+        vel_hist /= vel_sum
+    feats[18:26] = vel_hist
+
+    # Duration stats (2)
+    feats[26] = durations.mean()
+    feats[27] = durations.std() if len(durations) > 1 else 0.0
+
+    # Duration histogram (8)
+    dur_hist, _ = np.histogram(durations, bins=_DUR_BINS_TICKS)
+    dur_hist = dur_hist.astype(np.float64)
+    dur_sum = dur_hist.sum()
+    if dur_sum > 0:
+        dur_hist /= dur_sum
+    feats[28:36] = dur_hist
+
+    # IOI stats (2)
+    sorted_onsets = np.sort(np.unique(onsets))
+    if len(sorted_onsets) > 1:
+        ioi = np.diff(sorted_onsets)
+        feats[36] = ioi.mean()
+        feats[37] = ioi.std()
+
+    # Polyphony (2) — computed from onset coincidence
+    onset_counts = np.bincount(onsets.astype(int))
+    active_steps = onset_counts[onset_counts > 0]
+    if len(active_steps) > 0:
+        feats[38] = active_steps.mean()                                  # avg polyphony
+        feats[39] = (active_steps > 1).sum() / len(active_steps)         # polyphony rate
+
+    return feats
+
+
+def extract_features_from_dir(midi_dir: Path) -> np.ndarray:
+    """Extract feature matrix (N x 40) from all .mid files in a directory."""
+    paths = sorted(midi_dir.glob("*.mid"))
+    if not paths:
+        raise FileNotFoundError(f"No .mid files found in {midi_dir}")
+
+    features = []
+    for p in paths:
+        try:
+            score = Score(str(p))
+            feats = extract_midi_features(score)
+            features.append(feats)
+        except Exception as e:
+            logger.warning("Skipping %s: %s", p.name, e)
+
+    if not features:
+        raise RuntimeError(f"Could not extract features from any file in {midi_dir}")
+
+    return np.stack(features)
+
+
+# ---------------------------------------------------------------------------
+# Distribution metrics
+# ---------------------------------------------------------------------------
+
+_EPS = 1e-10
+
+
+def kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+    """Compute KL(P || Q) for discrete distributions *p* and *q*.
+
+    Both arrays must be non-negative and will be normalised internally.
+    Uses epsilon-smoothing to avoid log(0).
     """
-    # Create output directory
-    os.makedirs('plots', exist_ok=True)
+    p = np.asarray(p, dtype=np.float64).ravel()
+    q = np.asarray(q, dtype=np.float64).ravel()
 
-    # Create figure with two subplots if accuracy data is provided
-    if any(acc is not None for acc in [train_accuracies, val_accuracies]): #test_accuracies]):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    else:
-        fig, ax1 = plt.subplots(figsize=(8, 6))
+    p_sum, q_sum = p.sum(), q.sum()
+    if p_sum == 0 or q_sum == 0:
+        return 0.0
 
-    # Plot losses
-    epochs = range(1, len(train_losses) + 1)
-    ax1.plot(epochs, train_losses, 'b-', marker='o', label='Training Loss')
-    ax1.plot(epochs, val_losses, 'g-', marker='s', label='Validation Loss')
-    #ax1.plot(epochs, test_losses, 'r-', marker='^', label='Test Loss')
+    p = p / p_sum + _EPS
+    q = q / q_sum + _EPS
+    p /= p.sum()
+    q /= q.sum()
 
-    # Add moving average for smoothing
-    if len(train_losses) > 3:
-        window_size = min(5, len(train_losses) // 3)
-        train_ma = np.convolve(train_losses, np.ones(window_size) / window_size, mode='valid')
-        val_ma = np.convolve(val_losses, np.ones(window_size) / window_size, mode='valid')
-        #test_ma = np.convolve(test_losses, np.ones(window_size) / window_size, mode='valid')
-
-        ma_epochs = range(window_size, len(train_losses) + 1)
-        ax1.plot(ma_epochs, train_ma, 'b--', alpha=0.5, label='Training MA')
-        ax1.plot(ma_epochs, val_ma, 'g--', alpha=0.5, label='Validation MA')
-        #ax1.plot(ma_epochs, test_ma, 'r--', alpha=0.5, label='Test MA')
-
-    # Configure loss plot
-    ax1.set_title('Loss vs. Epochs')
-    ax1.set_xlabel('Epochs')
-    ax1.set_ylabel('Loss')
-    ax1.grid(True, linestyle='--', alpha=0.6)
-    ax1.legend(loc='upper right')
-
-    # Add loss values at endpoints
-    for i, loss_list in enumerate([train_losses, val_losses]): #, test_losses]):
-        if loss_list:
-            color = ['blue', 'green', 'red'][i]
-            name = ['Train', 'Val', 'Test'][i]
-            ax1.text(epochs[-1], loss_list[-1], f'{name}: {loss_list[-1]:.4f}',
-                     color=color, fontweight='bold', ha='right', va='bottom')
-
-    # Plot accuracies if provided
-    if any(acc is not None for acc in [train_accuracies, val_accuracies]): #, test_accuracies]):
-        if train_accuracies:
-            ax2.plot(epochs, train_accuracies, 'b-', marker='o', label='Training Accuracy')
-        if val_accuracies:
-            ax2.plot(epochs, val_accuracies, 'g-', marker='s', label='Validation Accuracy')
-        # if test_accuracies:
-        #    ax2.plot(epochs, test_accuracies, 'r-', marker='^', label='Test Accuracy')
-
-        # Add moving average for smoothing if enough data points
-        if train_accuracies and len(train_accuracies) > 3:
-            window_size = min(5, len(train_accuracies) // 3)
-
-            if train_accuracies:
-                train_acc_ma = np.convolve(train_accuracies, np.ones(window_size) / window_size, mode='valid')
-                ax2.plot(ma_epochs, train_acc_ma, 'b--', alpha=0.5, label='Training Acc MA')
-
-            if val_accuracies:
-                val_acc_ma = np.convolve(val_accuracies, np.ones(window_size) / window_size, mode='valid')
-                ax2.plot(ma_epochs, val_acc_ma, 'g--', alpha=0.5, label='Validation Acc MA')
-
-            #if test_accuracies:
-            #    test_acc_ma = np.convolve(test_accuracies, np.ones(window_size) / window_size, mode='valid')
-            #    ax2.plot(ma_epochs, test_acc_ma, 'r--', alpha=0.5, label='Test Acc MA')
-
-        # Configure accuracy plot
-        ax2.set_title('Accuracy vs. Epochs')
-        ax2.set_xlabel('Epochs')
-        ax2.set_ylabel('Accuracy')
-        ax2.grid(True, linestyle='--', alpha=0.6)
-        ax2.legend(loc='lower right')
-
-        # Add accuracy values at endpoints
-        for i, acc_list in enumerate([train_accuracies, val_accuracies]): #, test_accuracies]):
-            if acc_list:
-                color = ['blue', 'green', 'red'][i]
-                name = ['Train', 'Val', 'Test'][i]
-                ax2.text(epochs[-1], acc_list[-1], f'{name}: {acc_list[-1]:.4f}',
-                         color=color, fontweight='bold', ha='right', va='bottom')
-
-    # Adjust layout and save
-    plt.tight_layout()
-    plt.savefig('plots/training_metrics.png', dpi=300, bbox_inches='tight')
-
-    # Save loss and accuracy separately as well
-    plt.figure(figsize=(8, 6))
-    plt.plot(epochs, train_losses, 'b-', marker='o', label='Training Loss')
-    plt.plot(epochs, val_losses, 'g-', marker='s', label='Validation Loss')
-    #plt.plot(epochs, test_losses, 'r-', marker='^', label='Test Loss')
-    plt.title('Loss vs. Epochs')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend(loc='upper right')
-    plt.tight_layout()
-    plt.savefig('plots/loss_plot.png', dpi=300, bbox_inches='tight')
-
-    if all(acc is not None for acc in [train_accuracies, val_accuracies]): #, test_accuracies]):
-        plt.figure(figsize=(8, 6))
-        plt.plot(epochs, train_accuracies, 'b-', marker='o', label='Training Accuracy')
-        plt.plot(epochs, val_accuracies, 'g-', marker='s', label='Validation Accuracy')
-        #plt.plot(epochs, test_accuracies, 'r-', marker='^', label='Test Accuracy')
-        plt.title('Accuracy vs. Epochs')
-        plt.xlabel('Epochs')
-        plt.ylabel('Accuracy')
-        plt.grid(True, linestyle='--', alpha=0.6)
-        plt.legend(loc='lower right')
-        plt.tight_layout()
-        plt.savefig('plots/accuracy_plot.png', dpi=300, bbox_inches='tight')
-
-    plt.close('all')
+    return float(np.sum(p * np.log(p / q)))
 
 
-def plot_learning_rate(learning_rates, step_numbers):
+def overlapping_area(p: np.ndarray, q: np.ndarray) -> float:
+    """Overlap coefficient OA = sum(min(P_i, Q_i)) for normalised distributions.
+
+    Returns a value in [0, 1]:  1 = identical, 0 = disjoint.
     """
-    Plot learning rate schedule.
+    p = np.asarray(p, dtype=np.float64).ravel()
+    q = np.asarray(q, dtype=np.float64).ravel()
 
-    Args:
-        learning_rates: List of learning rates
-        step_numbers: List of corresponding step numbers
+    p_sum, q_sum = p.sum(), q.sum()
+    if p_sum == 0 or q_sum == 0:
+        return 0.0
+
+    p = p / p_sum
+    q = q / q_sum
+
+    return float(np.minimum(p, q).sum())
+
+
+def frechet_music_distance(feats_ref: np.ndarray, feats_gen: np.ndarray) -> float:
+    """Compute Frechet Music Distance between two (N x D) feature matrices.
+
+    FMD = ||mu_r - mu_g||^2 + Tr(S_r + S_g - 2 * sqrtm(S_r @ S_g))
     """
-    plt.figure(figsize=(10, 5))
-    plt.plot(step_numbers, learning_rates, 'b-')
-    plt.title('Learning Rate Schedule')
-    plt.xlabel('Training Steps')
-    plt.ylabel('Learning Rate')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.yscale('log')
-    plt.tight_layout()
-    plt.savefig('plots/learning_rate_schedule.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    from scipy import linalg
+
+    mu_r = np.mean(feats_ref, axis=0)
+    mu_g = np.mean(feats_gen, axis=0)
+    sigma_r = np.cov(feats_ref, rowvar=False)
+    sigma_g = np.cov(feats_gen, rowvar=False)
+
+    # Ensure 2-D covariance (single-feature edge case)
+    if sigma_r.ndim == 0:
+        sigma_r = np.array([[sigma_r]])
+        sigma_g = np.array([[sigma_g]])
+
+    diff = mu_r - mu_g
+    mean_term = diff.dot(diff)
+
+    eps = 1e-6
+    sqrt_product, _ = linalg.sqrtm(sigma_r.dot(sigma_g), disp=False)
+
+    if not np.isfinite(sqrt_product).all():
+        offset = np.eye(sigma_r.shape[0]) * eps
+        sqrt_product = linalg.sqrtm((sigma_r + offset).dot(sigma_g + offset))
+
+    # Discard small imaginary components from numerical error
+    sqrt_product = sqrt_product.real
+
+    trace_term = np.trace(sigma_r) + np.trace(sigma_g) - 2.0 * np.trace(sqrt_product)
+
+    return float(mean_term + trace_term)
 
 
-def plot_expert_activation(expert_activations, layer_idx=None):
+# ---------------------------------------------------------------------------
+# Per-feature-type KL and OA (pitch / duration / velocity histograms)
+# ---------------------------------------------------------------------------
+
+def _aggregate_histogram(features: np.ndarray, start: int, end: int) -> np.ndarray:
+    """Average a histogram slice across all samples."""
+    return features[:, start:end].mean(axis=0)
+
+
+def compute_distribution_metrics(
+    feats_ref: np.ndarray, feats_gen: np.ndarray,
+) -> dict[str, float]:
+    """Compute per-feature-type KL divergence and overlapping area.
+
+    Returns a dict with keys like ``pitch_kl``, ``pitch_oa``, etc.
     """
-    Plot expert activation counts.
+    slices = {
+        "pitch":    (0, 12),
+        "velocity": (18, 26),
+        "duration": (28, 36),
+    }
 
-    Args:
-        expert_activations: Dictionary mapping expert index to activation count
-        layer_idx: Layer index (optional, for multi-layer visualization)
+    results: dict[str, float] = {}
+    kl_values = []
+    oa_values = []
+
+    for name, (s, e) in slices.items():
+        hist_ref = _aggregate_histogram(feats_ref, s, e)
+        hist_gen = _aggregate_histogram(feats_gen, s, e)
+        kl_val = kl_divergence(hist_ref, hist_gen)
+        oa_val = overlapping_area(hist_ref, hist_gen)
+        results[f"{name}_kl"] = kl_val
+        results[f"{name}_oa"] = oa_val
+        kl_values.append(kl_val)
+        oa_values.append(oa_val)
+
+    results["mean_kl"] = float(np.mean(kl_values))
+    results["mean_oa"] = float(np.mean(oa_values))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Top-level evaluation entry point
+# ---------------------------------------------------------------------------
+
+def compute_generation_metrics(
+    reference_dir: Path, generated_dir: Path,
+) -> dict[str, float]:
+    """Compute all MIDI-level generation metrics.
+
+    Returns a dict with keys:
+        ``pitch_kl``, ``pitch_oa``,
+        ``velocity_kl``, ``velocity_oa``,
+        ``duration_kl``, ``duration_oa``,
+        ``mean_kl``, ``mean_oa``,
+        ``fmd``
     """
-    plt.figure(figsize=(12, 5))
+    feats_ref = extract_features_from_dir(reference_dir)
+    feats_gen = extract_features_from_dir(generated_dir)
 
-    experts = list(expert_activations.keys())
-    counts = list(expert_activations.values())
+    metrics = compute_distribution_metrics(feats_ref, feats_gen)
+    metrics["fmd"] = frechet_music_distance(feats_ref, feats_gen)
 
-    # Sort by expert index
-    sorted_experts = sorted(zip(experts, counts), key=lambda x: x[0])
-    experts, counts = zip(*sorted_experts)
-
-    # Plot as bar chart
-    bars = plt.bar(experts, counts, alpha=0.7)
-
-    # Add values on top of bars
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2., height + 0.1,
-                 f'{int(height)}', ha='center', va='bottom')
-
-    # Configure plot
-    title = f'Expert Activation Counts (Layer {layer_idx})' if layer_idx is not None else 'Expert Activation Counts'
-    plt.title(title)
-    plt.xlabel('Expert Index')
-    plt.ylabel('Activation Count')
-    plt.grid(True, linestyle='--', alpha=0.3, axis='y')
-    plt.tight_layout()
-
-    # Save
-    filename = f'plots/expert_activation_layer_{layer_idx}.png' if layer_idx is not None else 'plots/expert_activation.png'
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-def plot_attention_patterns(attention_weights, head_idx=0, layer_idx=0):
-    """
-    Plot attention patterns for visualization.
-
-    Args:
-        attention_weights: Tensor of attention weights [batch, heads, seq_len, seq_len]
-        head_idx: Attention head to visualize
-        layer_idx: Layer to visualize
-    """
-    # Get attention weights for specified head
-    attn = attention_weights[0, head_idx].cpu().numpy()
-
-    plt.figure(figsize=(8, 6))
-    plt.imshow(attn, cmap='viridis')
-    plt.colorbar()
-    plt.title(f'Attention Weights (Layer {layer_idx}, Head {head_idx})')
-    plt.xlabel('Key Position')
-    plt.ylabel('Query Position')
-    plt.tight_layout()
-    plt.savefig(f'plots/attention_map_L{layer_idx}_H{head_idx}.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    return metrics
